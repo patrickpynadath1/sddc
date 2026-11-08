@@ -1,0 +1,104 @@
+defaults:
+- algorithm: mdlm
+- model: dit
+- parameterization: posterior
+- prediction: posterior
+- representation: one_hot
+- process: absorbing
+- objective: weighted_ce
+- time_sampler: antithetic
+- noise_schedule: log_linear
+- task: sudoku
+- datamodule: task
+- evaluator: generation
+- callback: task
+- sampler: entropy_bounded
+- lr_scheduler: constant_warmup
+- strategy: null
+- variable_length: null
+- _self_
+self_conditioning:
+  gradient_mode: detached
+  enabled: false
+  source: posterior_mean
+  probability: 0.9
+  evaluation_probability: 1.0
+block_diffusion:
+  enabled: false
+  block_size: 32
+  clean_loss: none
+  clean_loss_weight: 1.0
+  cache_clean_prefix: true
+  # Per-active-block capacity for variable-length sampling. Null uses block_size.
+  max_length: null
+token_feedback:
+  enabled: false
+  depth: 3
+  loss_weight: 1.0
+  # Stop main-loss gradients through feedback probabilities; auxiliary CE stays attached.
+  detach: false
+compile: true
+mode: train
+seed: 1
+output_dir: ${hydra:runtime.output_dir}
+loader:
+  global_batch_size: 256
+  eval_batch_size: 64
+  num_workers: 4
+  pin_memory: true
+training:
+  ema: 0.9999
+  warmup_steps: 2500
+  performance:
+    hidden_only_bootstrap: false
+    activation_checkpointing: false
+    compile:
+      enabled: false
+      backend: inductor
+      mode: default
+      dynamic: true
+      fullgraph: false
+      objective: false
+optimizer:
+  fused: null
+  lr: 0.0003
+  beta1: 0.9
+  beta2: 0.999
+  epsilon: 1.0e-08
+  weight_decay: 0.0
+trainer:
+  accelerator: gpu
+  devices: 1
+  num_nodes: 1
+  strategy: auto
+  precision: bf16-mixed
+  accumulate_grad_batches: 4
+  max_steps: 50000
+  gradient_clip_val: 1.0
+  log_every_n_steps: 10
+  num_sanity_val_steps: 2
+  val_check_interval: 20000
+  check_val_every_n_epoch: null
+  limit_train_batches: 1.0
+  limit_val_batches: 1.0
+  enable_progress_bar: true
+checkpoint:
+  resume: null
+  every_n_steps: 5000
+evaluation:
+  policy: null
+  checkpoint: null
+  legacy: false
+  use_ema: true
+  allow_config_mismatch: false
+  device: cuda
+  max_examples: null
+wandb: null
+hydra:
+  run:
+    dir: core/outputs/${now:%Y-%m-%d}/${now:%H-%M-%S}
+  sweep:
+    dir: core/outputs/sweeps/${now:%Y-%m-%d}/${now:%H-%M-%S}
+    subdir: ${hydra.job.num}
+  job:
+    chdir: false

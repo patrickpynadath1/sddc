@@ -1,0 +1,30 @@
+# Local environments and tooling
+.venv/
+.env
+.env.*
+.agents
+.codex
+.claude/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+__pycache__/
+*.py[cod]
+.DS_Store
+
+# Generated artifacts and cache symlinks (do not follow or commit their targets)
+outputs
+data_cache
+.cache/
+wandb/
+*.log
+*.ckpt
+*.pt
+*.safetensors
+
+# Packaging and coverage
+build/
+dist/
+*.egg-info/
+.coverage*
+htmlcov/

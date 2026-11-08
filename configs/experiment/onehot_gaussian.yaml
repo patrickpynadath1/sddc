@@ -1,0 +1,8 @@
+# @package _global_
+defaults:
+- gaussian_base
+- override /noise_schedule: linear_interpolation
+- _self_
+model:
+  input:
+    preconditioning: none

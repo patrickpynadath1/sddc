@@ -1,0 +1,34 @@
+# @package _global_
+# Worked example experiments/continuous-schedules: how CDCD learned schedules
+# spend training, and what self-conditioning does to continuous methods.
+# 4 continuous paths x {no SC, SC} x 3 tasks = 24 cases, all with the CDCD
+# learned clock, the 8-layer / 512-wide backbone and 20k training steps.
+defaults:
+- /experiment: corruption_factorial
+- common
+- /ablation_path: gaussian
+- /feedback: none
+- /inference_policies: hybrid_renoising
+- override /path_schedule: cdcd
+- override /task: battery/sudoku_hard
+- _self_
+checkpoint:
+  every_n_steps: 1000
+data:
+  # Read only by TinyStories: the story cohort the evaluation indices refer to.
+  # Build it with scripts/prepare_data.py.
+  allowed_ids_path: ${data.cache_dir}/allowed_ids.json
+preparation:
+  name: continuous-schedules
+  output: ${oc.env:SDDC_STORAGE_ROOT,${oc.env:HOME}/.cache/sddc}/plans/continuous-schedules
+  family: continuous_schedules
+  recipe_name: ${preparation.path_name}-${preparation.feedback_name}
+  evaluation_file: experiments/continuous-schedules/evaluation/${preparation.task_name}.json
+  wandb:
+    project: continuous-schedules
+hydra:
+  sweeper:
+    params:
+      task: battery/sudoku_hard,battery/text8,battery/tinystories_bpe
+      ablation_path: gaussian,simplex,spherical,spherical_vmf
+      feedback: none,expected_embedding

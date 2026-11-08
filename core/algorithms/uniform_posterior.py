@@ -1,0 +1,67 @@
+"""Uniform corruption trained as clean-token posterior prediction with CE.
+
+One uniform-posterior view bound to the configured token network's embedding table;
+the network reads -log(keep).
+"""
+
+
+from core.modifiers.hybrid.one_view import OneViewAlgorithm
+from core.modifiers.hybrid.training import HybridDiffusion
+from core.objectives.cross_entropy import CrossEntropy
+from core.parameterizations.posterior import PosteriorParameterization
+from core.parameterizations.constraints import UnconstrainedPosterior
+from core.processes.uniform_posterior import PosteriorUniformProcess
+from core.modifiers.hybrid.views import DiffusionView
+from core.representations.noisy_inputs import TokenRepresentation
+from core.samplers.hybrid_updates import DiscretePosteriorUpdate
+
+
+class PosteriorUniformDiffusion(OneViewAlgorithm, HybridDiffusion):
+    def __init__(
+        self,
+        model,
+        predictor,
+        process,
+        schedule,
+        time_sampler,
+        objective,
+        length=180,
+        prediction=None,
+    ):
+        if (
+            not isinstance(predictor, PosteriorParameterization)
+            or not isinstance(predictor.constraints, UnconstrainedPosterior)
+            or predictor.mask_index is not None
+        ):
+            raise TypeError(
+                "posterior uniform diffusion requires an unconstrained posterior; noisy tokens are not revealed clean tokens"
+            )
+        if not isinstance(process, PosteriorUniformProcess):
+            raise TypeError(
+                "posterior uniform diffusion requires PosteriorUniformProcess"
+            )
+        if not isinstance(objective, CrossEntropy) or objective.requires_context:
+            raise TypeError(
+                "posterior uniform diffusion requires cross entropy without Gaussian path weighting"
+            )
+        if getattr(schedule, "output_kind", None) != "keep_rate":
+            raise TypeError("posterior uniform diffusion requires a keep-rate schedule")
+        if not model.adaLN:
+            raise ValueError(
+                "posterior uniform diffusion requires time conditioning (adaLN=true)"
+            )
+        if process.vocab_size != model.output_layer.linear.out_features:
+            raise ValueError("model and process vocabulary sizes must agree")
+        table = model.token_table
+        representation = TokenRepresentation(*table.shape, embedding=table)
+        view = DiffusionView(process, schedule, representation, DiscretePosteriorUpdate())
+        model.time.coordinate = "negative_log_keep_exact"
+        network = model.bind_views([view])
+        super().__init__(
+            network,
+            predictor,
+            time_sampler,
+            objective,
+            length=length,
+            prediction=prediction,
+        )

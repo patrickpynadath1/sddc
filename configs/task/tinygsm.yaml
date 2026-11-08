@@ -1,0 +1,20 @@
+defaults:
+- /data@_global_.data: tinygsm
+- /token_space@_global_.token_space: tinygsm
+- _self_
+_target_: core.tasks.tinygsm.TinyGSMTask
+data: ${data}
+vocab_size: 49153
+length: 512
+evaluation:
+  cache_dir: ${data.cache_dir}
+  data_path: null
+  # Held-out GSM8K train slice used for selection (primary metric).
+  validation_data_path: null
+  validation_size: 500
+  validation_seed: 0
+  separator: ${data.separator}
+  scoring: code
+  timeout: 3.0
+  bootstrap_size: 1
+  seed: 1

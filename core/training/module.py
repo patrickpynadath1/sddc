@@ -1,0 +1,341 @@
+"""Lightning lifecycle, deliberately separate from MDLM mathematics."""
+
+from contextlib import contextmanager
+import random
+import numpy as np
+import lightning as L
+from omegaconf import OmegaConf
+import torch
+
+from hydra.utils import instantiate
+from .ema import ExponentialMovingAverage
+
+
+def build_algorithm(config):
+    """Instantiate the algorithm and wrap it with the configured modifiers.
+
+    The order (encoder-decoder, variable length, block diffusion, token
+    feedback) fixes parameter paths, so existing checkpoints keep loading.
+    """
+    algorithm = instantiate(config.algorithm)
+    encoder_decoder = config.get("encoder_decoder")
+    if encoder_decoder is not None:
+        if not config.get("block_diffusion", {}).get("enabled", False):
+            raise ValueError(
+                "encoder_decoder currently requires block diffusion visibility"
+            )
+        if config.get("variable_length") is not None:
+            raise ValueError(
+                "encoder_decoder currently requires fixed-length blocks"
+            )
+        algorithm.model = instantiate(
+            encoder_decoder, model=algorithm.model
+        )
+    structural = config.get("variable_length")
+    if structural is not None:
+        algorithm = instantiate(structural, algorithm=algorithm)
+    block = config.get("block_diffusion", {})
+    if block.get("enabled", False):
+        from core.modifiers.block_diffusion import BlockDiffusion
+
+        algorithm = BlockDiffusion(
+            algorithm,
+            block_size=block.block_size,
+            clean_loss=block.get("clean_loss", "none"),
+            clean_loss_weight=block.get("clean_loss_weight", 1.0),
+            cache_clean_prefix=block.get("cache_clean_prefix", True),
+            max_length=block.get("max_length"),
+            x0_causal=block.get("x0_causal", True),
+            training=instantiate(block.get("training")),
+        )
+    feedback = config.get("token_feedback", {})
+    if feedback.get("enabled", False):
+        from core.modifiers.token_feedback import TokenFeedback
+
+        algorithm = TokenFeedback(
+            algorithm,
+            depth=feedback.depth,
+            loss_weight=feedback.get("loss_weight", 1.0),
+            detach=feedback.get("detach", False),
+        )
+    if config.get("self_conditioning", {}).get("enabled", False):
+        policy = getattr(algorithm, "prediction", None)
+        if policy is None or not policy.enabled:
+            raise ValueError(
+                "self-conditioning requires an enabled prediction coordinator on this algorithm"
+            )
+    return algorithm
+
+
+class TrainingModule(L.LightningModule):
+    def __init__(self, config):
+        super().__init__()
+        raw = (
+            OmegaConf.to_container(config, resolve=False)
+            if OmegaConf.is_config(config)
+            else config
+        )
+        self.config = OmegaConf.create(raw)
+        self.save_hyperparameters(
+            {"config": OmegaConf.to_container(self.config, resolve=True)}
+        )
+        self.algorithm = build_algorithm(self.config)
+        self.ema = (
+            ExponentialMovingAverage(
+                self.algorithm.parameters(), self.config.training.ema
+            )
+            if self.config.training.ema > 0
+            else None
+        )
+        self._pending_rng = None
+        self._train_metric_totals = {}
+        initialization = self.config.training.get("initialize_from")
+        if (
+            initialization
+            and self.config.mode == "train"
+            and not self.config.checkpoint.resume
+        ):
+            from .checkpoints import initialize_weights
+
+            initialize_weights(self, initialization)
+
+    def on_fit_start(self):
+        from .performance import configure_performance
+
+        configure_performance(self)
+        if self.ema:
+            self.ema.move_shadow_params_to_device(self.device)
+
+    def on_train_start(self):
+        if self._pending_rng:
+            state = self._pending_rng
+            torch.set_rng_state(state["torch"].cpu())
+            random.setstate(state["python"])
+            np.random.set_state(state["numpy"])
+            if self.device.type == "cuda" and state.get("cuda") is not None:
+                torch.cuda.set_rng_state(state["cuda"].cpu(), self.device)
+            self._pending_rng = None
+
+    def training_step(self, batch, batch_idx):
+        result = self.algorithm.loss(
+            batch["input_ids"],
+            batch["loss_mask"],
+            corruption_mask=batch.get("corruption_mask"),
+            **(
+                {"valid_mask": batch.get("attention_mask")}
+                if getattr(self.algorithm, "supports_variable_length", False)
+                else {}
+            ),
+            step=self.global_step,
+            training=True,
+            global_batch_size=self.config.loader.global_batch_size,
+            world_size=self.trainer.world_size,
+            rank=self.global_rank,
+            accumulation_steps=self.trainer.accumulate_grad_batches,
+            accumulation_index=batch_idx % self.trainer.accumulate_grad_batches,
+        )
+        # Accumulate detached, token-weighted metrics across microbatches.
+        # Logging only the last microbatch aliases the stratified time ranges.
+        count = result["num_tokens"].detach().float()
+        for key in (
+            "loss",
+            "main_loss",
+            "clean_decoding_loss",
+            "decoded_denoising_ce",
+            "token_feedback_loss",
+            "content_loss",
+            "insertion_loss",
+            "insertion_content_loss",
+        ):
+            if key in result:
+                value = result[key].detach().float() * count
+                previous_sum, previous_count = self._train_metric_totals.get(
+                    key, (0, 0)
+                )
+                self._train_metric_totals[key] = (
+                    previous_sum + value,
+                    previous_count + count,
+                )
+        return result["loss"]
+
+    def on_before_optimizer_step(self, optimizer):
+        for name, (total, count) in self._train_metric_totals.items():
+            self.log(
+                f"train/{name}",
+                total / count.clamp_min(1),
+                on_step=True,
+                on_epoch=False,
+                sync_dist=True,
+            )
+        self._train_metric_totals.clear()
+
+    @contextmanager
+    def evaluation_weights(self, use_ema=True):
+        was_training = self.algorithm.training
+        if use_ema and self.ema:
+            self.ema.move_shadow_params_to_device(self.device)
+            self.ema.store(self.algorithm.parameters())
+            self.ema.copy_to(self.algorithm.parameters())
+        self.algorithm.eval()
+        try:
+            yield
+        finally:
+            if use_ema and self.ema:
+                self.ema.restore(self.algorithm.parameters())
+            self.algorithm.train(was_training)
+
+    def on_validation_epoch_start(self):
+        # Validation corruption draws must neither depend on nor perturb the
+        # training stream, or val/nll (and best.ckpt) would vary with how often
+        # validation runs, and resumed runs would diverge.
+        devices = [self.device.index] if self.device.type == "cuda" else []
+        self._validation_rng = torch.random.fork_rng(devices=devices)
+        self._validation_rng.__enter__()
+        torch.manual_seed(self.config.get("seed", 0) + self.global_rank)
+        self._validation_context = self.evaluation_weights()
+        self._validation_context.__enter__()
+        self._valid_sum = torch.zeros((), device=self.device)
+        self._valid_count = torch.zeros((), device=self.device)
+
+    def validation_step(self, batch, batch_idx):
+        result = self.algorithm.loss(
+            batch["input_ids"],
+            batch["loss_mask"],
+            corruption_mask=batch.get("corruption_mask"),
+            **(
+                {"valid_mask": batch.get("attention_mask")}
+                if getattr(self.algorithm, "supports_variable_length", False)
+                else {}
+            ),
+        )
+        self._valid_sum += result["loss_sum"]
+        self._valid_count += result["num_tokens"]
+
+    def on_validation_epoch_end(self):
+        totals = (
+            self.all_gather(torch.stack([self._valid_sum, self._valid_count]))
+            .reshape(-1, 2)
+            .sum(0)
+        )
+        self.log(
+            getattr(self.algorithm, "validation_metric", "val/nll"),
+            totals[0] / totals[1].clamp_min(1),
+            sync_dist=False,
+        )
+        self._validation_context.__exit__(None, None, None)
+        self._validation_rng.__exit__(None, None, None)
+
+    def optimizer_step(self, *args, **kwargs):
+        super().optimizer_step(*args, **kwargs)
+        if self.ema:
+            self.ema.update(self.algorithm.parameters())
+        # Match the reference lifecycle: EMA sees the optimizer's update,
+        # then representations enforce their parameter constraints.
+        for component in self.algorithm.modules():
+            hook = getattr(component, "post_optimizer_step", None)
+            if callable(hook):
+                hook()
+
+    def optimizer_parameters(self, config):
+        """Optional parameter-name groups, validated to avoid overlap/typos."""
+        import fnmatch
+
+        groups = config.get("groups", [])
+        if not groups:
+            return self.algorithm.parameters()
+        named = dict(self.algorithm.named_parameters())
+        used, result = set(), []
+        for group in groups:
+            names = [
+                name
+                for name in named
+                if any(fnmatch.fnmatchcase(name, pattern) for pattern in group.patterns)
+            ]
+            if not names or used.intersection(names):
+                raise ValueError(
+                    "optimizer groups must match parameters without overlap"
+                )
+            for pattern in group.patterns:
+                if not any(fnmatch.fnmatchcase(name, pattern) for name in names):
+                    raise ValueError(
+                        f"optimizer pattern {pattern!r} matches no parameters"
+                    )
+            used.update(names)
+            options = {key: value for key, value in group.items() if key != "patterns"}
+            result.append({"params": [named[name] for name in names], **options})
+        remaining = [parameter for name, parameter in named.items() if name not in used]
+        return [{"params": remaining}, *result] if remaining else result
+
+    def configure_optimizers(self):
+        c = self.config.optimizer
+        optimizer = torch.optim.AdamW(
+            self.optimizer_parameters(c),
+            lr=c.lr,
+            betas=(c.beta1, c.beta2),
+            eps=c.epsilon,
+            weight_decay=c.weight_decay,
+            fused=c.get("fused", None),
+        )
+        if c.get("fused", None) is not None:
+            from .performance import restore_optimizer_execution
+
+            from functools import partial
+
+            optimizer.register_load_state_dict_post_hook(
+                partial(restore_optimizer_execution, fused=c.fused)
+            )
+        if self.config.get("lr_scheduler") is not None:
+            scheduler = instantiate(self.config.lr_scheduler, optimizer=optimizer)
+        else:
+            # Saved runs predating the scheduler config group retain their recipe.
+            from .schedules import constant_warmup
+
+            scheduler = constant_warmup(optimizer, self.config.training.warmup_steps)
+        return {
+            "optimizer": optimizer,
+            "lr_scheduler": {"scheduler": scheduler, "interval": "step"},
+        }
+
+    def configure_gradient_clipping(
+        self, optimizer, gradient_clip_val=None, gradient_clip_algorithm=None
+    ):
+        # Lightning's AMP plugin rejects fused AdamW clipping even in BF16,
+        # where no GradScaler/unscaling exists. Clip these unscaled gradients
+        # directly; leave FP16 and other precision plugins to Lightning.
+        if (
+            self.config.optimizer.get("fused", False)
+            and self.config.trainer.precision == "bf16-mixed"
+        ):
+            if gradient_clip_val is None or gradient_clip_val <= 0:
+                return
+            parameters = [
+                p for group in optimizer.param_groups for p in group["params"]
+            ]
+            if gradient_clip_algorithm == "value":
+                torch.nn.utils.clip_grad_value_(parameters, gradient_clip_val)
+            else:
+                torch.nn.utils.clip_grad_norm_(parameters, gradient_clip_val)
+        else:
+            super().configure_gradient_clipping(
+                optimizer, gradient_clip_val, gradient_clip_algorithm
+            )
+
+    def on_save_checkpoint(self, checkpoint):
+        checkpoint["core_format_version"] = 1
+        if self.ema:
+            checkpoint["ema"] = self.ema.state_dict()
+        checkpoint["rng"] = {
+            "torch": torch.get_rng_state(),
+            "python": random.getstate(),
+            "numpy": np.random.get_state(),
+            "cuda": torch.cuda.get_rng_state(self.device)
+            if self.device.type == "cuda"
+            else None,
+        }
+
+    def on_load_checkpoint(self, checkpoint):
+        if self.ema:
+            if "ema" not in checkpoint:
+                raise ValueError("EMA-enabled resume requires saved EMA state")
+            self.ema.load_state_dict(checkpoint["ema"])
+        self._pending_rng = checkpoint.get("rng")
